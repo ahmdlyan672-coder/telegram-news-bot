@@ -143,7 +143,7 @@ TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
 OUR_USERNAME = "@newssokl"
 _OUR_USER_PLAIN = "newssokl"
 
-CHANNEL_PUBLIC_LINK = "https://t.me/newssokl"
+# ✅ لم نعد نستخدم رابط القناة داخل التوقيع
 BRAND_NAME = os.environ.get("BRAND_NAME", "اخبار المرصد").strip()
 
 # ✅ بحث كل 10 ثواني
@@ -223,10 +223,11 @@ def strip_external_usernames(text: str) -> str:
 
 def append_our_signature(text: str) -> str:
     base = (text or "").strip()
-    sig = f"\n\n—\n{BRAND_NAME}\n{OUR_USERNAME} | {CHANNEL_PUBLIC_LINK}".strip()
+    # ✅ التوقيع: فقط اسم البراند + اليوزر (بدون رابط)
+    sig = f"\n\n—\n{BRAND_NAME}\n{OUR_USERNAME}".strip()
 
     low = base.lower()
-    if _OUR_USER_PLAIN in low or CHANNEL_PUBLIC_LINK.lower() in low:
+    if _OUR_USER_PLAIN in low:
         return base
     return (base + sig) if base else sig
 
@@ -392,14 +393,32 @@ def format_pretty_text(post: Dict) -> str:
     sep = "—" * 18
     return f"{header}{sep}\n{body_html}".strip()
 
-def build_caption_from_formatted(formatted_html: str) -> Tuple[str, Optional[str]]:
-    if len(formatted_html) <= 900:
-        return formatted_html, None
-    cap = formatted_html[:900].rstrip() + "…"
-    extra = formatted_html[900:].lstrip()
-    if extra:
-        extra = "…" + extra
-    return cap, extra
+# ✅✅ FIX: لا ترسل extra أبداً، وخلي التوقيع دائماً داخل الكابتشن حتى لو قصّينا
+def build_caption_from_formatted(formatted_html: str) -> str:
+    MAX_CAPTION = 900
+    s = (formatted_html or "").strip()
+    if len(s) <= MAX_CAPTION:
+        return s
+
+    # ✅ نحاول نثبت "كتلة التوقيع" داخل الكابتشن دائماً (اليوزر فقط)
+    sig_key = html.escape(f"{OUR_USERNAME}")
+    idx = s.rfind(sig_key)
+
+    tail = ""
+    if idx != -1:
+        # نأخذ من خط الفاصل "—" إلى النهاية (حتى يبقى التوقيع كامل)
+        start = s.rfind("—", 0, idx)
+        if start != -1:
+            tail = s[start:].strip()
+        else:
+            tail = s[max(0, idx - 120):].strip()
+
+    if tail and len(tail) < MAX_CAPTION - 50:
+        head_limit = MAX_CAPTION - len(tail) - 2
+        head = s[:head_limit].rstrip()
+        return (head + "…\n" + tail).strip()
+
+    return (s[:MAX_CAPTION - 1].rstrip() + "…").strip()
 
 # =========================
 # Download media
@@ -467,7 +486,8 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
         await send_text_html(bot, chat_id, formatted)
         return True
 
-    caption, extra = build_caption_from_formatted(formatted)
+    # ✅ هنا صار الكابتشن يرجع نص واحد فقط (بدون extra)
+    caption = build_caption_from_formatted(formatted)
 
     file_obj = await asyncio.to_thread(download_media_bytes, media_url)
     if not file_obj:
@@ -497,9 +517,6 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
             pass
 
     await asyncio.sleep(SLEEP_BETWEEN_SENDS)
-    if extra:
-        await send_text_html(bot, chat_id, extra)
-
     return True
 
 # =========================
@@ -520,7 +537,7 @@ async def main():
     log.info(f"🎯 Target: {TARGET_CHANNEL}")
     log.info(f"📡 Sources: {len(SOURCES)} channels")
     log.info(f"⚡ Check every: {CHECK_EVERY_SECONDS}s | Fresh window: {MAX_AGE_SECONDS}s")
-    log.info(f"🏷️ Our username: {OUR_USERNAME} | Link: {CHANNEL_PUBLIC_LINK}")
+    log.info(f"🏷️ Our username: {OUR_USERNAME}")
 
     backoff = 0.2
     last_prune = time.time()
