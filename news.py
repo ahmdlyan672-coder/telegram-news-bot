@@ -79,12 +79,43 @@ def parse_iso_datetime_to_utc(s: str) -> Optional[datetime]:
         return None
 
 def normalize_text(text: str) -> str:
-    # تنظيف آمن بدون حذف كلمات/سطور محتوى
     if not text:
         return ""
     t = html.unescape(text).replace("\r", "")
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+def remove_hashtags_and_freq(text: str) -> str:
+    """
+    - يحذف الهاشتاكات (#...) عربي/انجليزي
+    - يحذف سطور التردد/ترددات
+    - يحذف أرقام 5 خانات (مثل 27500) لأنها غالباً تردد
+    """
+    if not text:
+        return ""
+
+    t = text
+
+    # حذف سطور فيها كلمة "تردد" أو "ترددات"
+    lines = t.splitlines()
+    filtered_lines = []
+    for line in lines:
+        if re.search(r"\bتردد\b|\bترددات\b", line):
+            continue
+        filtered_lines.append(line)
+    t = "\n".join(filtered_lines)
+
+    # حذف الهاشتاكات
+    t = re.sub(r"#([\w\u0600-\u06FF_]+)", "", t)
+
+    # حذف أرقام 5 خانات
+    t = re.sub(r"\b\d{5}\b", "", t)
+
+    # تنظيف فراغات
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"^\s+|\s+$", "", t, flags=re.MULTILINE)
     return t.strip()
 
 def is_fresh(dt_utc: Optional[datetime], max_age_seconds: int) -> bool:
@@ -103,44 +134,36 @@ def content_fingerprint(text: str, media_url: Optional[str]) -> str:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
 
-# ✅ سريع جداً
-CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "1"))          # افتراضي 1 ثانية
-SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.30"))     # زيادة بسيطة لتقليل Flood
+CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "1"))
+SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.30"))
 MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "30"))
 
-# ✅ فقط أقل من دقيقة
 MAX_AGE_SECONDS = int(os.environ.get("MAX_AGE_SECONDS", "60"))
-
-# ✅ نقلل القراءة حتى يصير أسرع
 FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "12"))
-
 DISABLE_WEB_PREVIEW = env_bool("DISABLE_WEB_PREVIEW", True)
 
-# حدود تحميل الميديا (حتى ما يطيح السيرفر بسبب فيديوهات كبيرة)
-MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(20 * 1024 * 1024)))  # 20MB افتراضيًا
+MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(15 * 1024 * 1024)))  # 15MB افتراضيًا
 
-# مصادر (تقدر تزوّدها من ENV: SOURCES كـ JSON)
+# ✅ مصادر (أنت تقدر تستبدلها عبر ENV: SOURCES كـ JSON)
+# ملاحظة: لا يوجد قنوات روسية هنا.
 SOURCES = _json_list_env("SOURCES") or [
+    # إيران بالعربي / إعلام قريب من إيران
     "IraninArabic",
     "iraninarabic_ir",
     "arabic_farsnews",
     "Tasnim_Ar",
-    "alalamarabic",
     "Khamenei_arabi",
 
-    "almayadeen",
-    "almanarnews",
-    "ajanews",
-    "Alarabiya",
-    "alhadath_brk",
-    "AlarabyTelevision",
-    "RTarabic_br",
+    # ✅ قناة العالم - عاجل
+    "alalamarabic",
 
-    "Iraq_now3",
-    "iraqalhadath_net",
-    "mehwar_1",
-    "Iran_bel_Arabi",
-    "alentedar",
+    # محور قريب من إيران (إعلامي)
+    "almayadeen",
+		"Iraq_now3",
+		"mehwar_1",
+		"iraqalhadath_net",
+    "almanarnews",
+    "manarbreaking",
 ]
 
 DB_FILE = os.environ.get("DB_FILE", "posted.sqlite3")
@@ -194,7 +217,6 @@ SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
 SESSION_TIMEOUT = 20
 
 def extract_media(block) -> Tuple[Optional[str], Optional[str]]:
-    # Photo
     photo_wrap = block.select_one("a.tgme_widget_message_photo_wrap")
     if photo_wrap:
         style = photo_wrap.get("style", "")
@@ -202,7 +224,6 @@ def extract_media(block) -> Tuple[Optional[str], Optional[str]]:
         if m:
             return "photo", m.group(1)
 
-    # Video
     video = block.select_one("div.tgme_widget_message_video_wrap video")
     if video:
         src = video.get("src")
@@ -224,7 +245,7 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
     posts: List[Dict] = []
 
     for b in blocks[-limit:]:
-        data_post = b.get("data-post")  # channel/123
+        data_post = b.get("data-post")
         if not data_post:
             continue
 
@@ -236,6 +257,7 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
         text_el = b.select_one("div.tgme_widget_message_text")
         text = text_el.get_text("\n").strip() if text_el else ""
         text = normalize_text(text)
+        text = remove_hashtags_and_freq(text)
 
         media_type, media_url = extract_media(b)
 
@@ -244,7 +266,7 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
 
         posts.append({
             "id": data_post,
-            "src": username,  # داخلي فقط
+            "src": username,
             "dt_utc": dt_utc,
             "text": text,
             "media_type": media_type,
@@ -260,9 +282,6 @@ async def fetch_channel_posts(username: str, limit: int) -> List[Dict]:
 # Message format (NO SOURCE / NO LINK / NO TIME)
 # =========================
 def format_pretty_text(post: Dict) -> str:
-    """
-    ✅ شكل جميل: عنوان + النص فقط (بدون وقت/رابط/مصدر).
-    """
     body = post.get("text", "") or ""
     body = html.escape(body)
 
@@ -272,7 +291,6 @@ def format_pretty_text(post: Dict) -> str:
     return text.strip()
 
 def build_caption_from_formatted(formatted_html: str) -> Tuple[str, Optional[str]]:
-    # كابشن الميديا 1024؛ نخلي هامش
     if len(formatted_html) <= 900:
         return formatted_html, None
     cap = formatted_html[:900].rstrip() + "…"
@@ -282,12 +300,9 @@ def build_caption_from_formatted(formatted_html: str) -> Tuple[str, Optional[str
     return cap, extra
 
 # =========================
-# Download media (to avoid Telegram "Wrong type of web page content")
+# Download media
 # =========================
 def download_media_bytes(url: str) -> Optional[io.BytesIO]:
-    """
-    يحمل الميديا داخل الذاكرة بحد أقصى MAX_MEDIA_BYTES.
-    """
     try:
         with requests.get(url, timeout=20, stream=True) as r:
             r.raise_for_status()
@@ -299,6 +314,10 @@ def download_media_bytes(url: str) -> Optional[io.BytesIO]:
                 total += len(chunk)
                 if total > MAX_MEDIA_BYTES:
                     log.warning(f"Media too large ({total} bytes), skipping download.")
+                    try:
+                        buf.close()
+                    except Exception:
+                        pass
                     return None
                 buf.write(chunk)
             buf.seek(0)
@@ -340,7 +359,6 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
     media_type = post.get("media_type")
     media_url = post.get("media_url")
 
-    # Text only
     if not media_type or not media_url:
         if not formatted:
             return False
@@ -349,10 +367,8 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
 
     caption, extra = build_caption_from_formatted(formatted)
 
-    # Download first then send as file to avoid Telegram URL issues
     file_obj = await asyncio.to_thread(download_media_bytes, media_url)
     if not file_obj:
-        # fallback to text only
         await send_text_html(bot, chat_id, formatted)
         return True
 
@@ -385,7 +401,7 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
     return True
 
 # =========================
-# Main loop (FAST + parallel fetch)
+# Main loop
 # =========================
 async def main():
     threading.Thread(target=start_health_server, daemon=True).start()
@@ -408,7 +424,6 @@ async def main():
 
     while True:
         sent_this_cycle = 0
-
         try:
             tasks = [fetch_channel_posts(src, FETCH_LIMIT_PER_SOURCE) for src in SOURCES]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -419,7 +434,6 @@ async def main():
                     continue
                 all_posts.extend(r)
 
-            # فقط آخر دقيقة
             fresh_posts = [p for p in all_posts if is_fresh(p.get("dt_utc"), MAX_AGE_SECONDS)]
             fresh_posts.sort(key=lambda x: x.get("dt_utc") or now_utc())
 
@@ -445,7 +459,6 @@ async def main():
             log.exception(f"Unexpected error: {e}")
             backoff = min(backoff * 2, 30)
 
-        # تنظيف DB كل 6 ساعات
         if time.time() - last_prune > 6 * 3600:
             try:
                 prune_old(con)
