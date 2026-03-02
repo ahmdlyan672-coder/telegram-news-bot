@@ -44,7 +44,6 @@ def start_health_server():
             self.wfile.write(b"OK")
 
         def do_HEAD(self):
-            # مهم حتى ما يطلع 501 عند UptimeRobot
             self._send_ok_headers()
 
         def log_message(self, format, *args):
@@ -96,11 +95,6 @@ def normalize_text(text: str) -> str:
     return t.strip()
 
 def remove_hashtags_and_freq(text: str) -> str:
-    """
-    - يحذف الهاشتاكات (#...) عربي/انجليزي
-    - يحذف سطور التردد/ترددات
-    - يحذف أرقام 5 خانات (مثل 27500) لأنها غالباً تردد
-    """
     if not text:
         return ""
 
@@ -134,32 +128,119 @@ def is_fresh(dt_utc: Optional[datetime], max_age_seconds: int) -> bool:
     return 0 <= age <= max_age_seconds
 
 def parse_post_id(data_post: str) -> Tuple[str, int]:
-    # "channel/123" -> ("channel", 123)
     try:
         ch, mid = data_post.split("/", 1)
         return ch, int(mid)
     except Exception:
         return "", -1
 
+# =========================
+# Config (ثابتة حسب طلبك)
+# =========================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
+
+OUR_USERNAME = "@newssokl"
+_OUR_USER_PLAIN = "newssokl"
+
+CHANNEL_PUBLIC_LINK = "https://t.me/newssokl"
+BRAND_NAME = os.environ.get("BRAND_NAME", "اخبار المرصد").strip()
+
+# ✅ بحث كل 10 ثواني
+CHECK_EVERY_SECONDS = 10
+
+# إرسال سريع (انتبه من Flood)
+SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.15"))
+
+MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "50"))
+
+# ✅ أي خبر عمره أكثر من 60 ثانية لا ينشر
+MAX_AGE_SECONDS = 60
+
+# ✅ خليها صغيرة للسرعة
+FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "3"))
+
+DISABLE_WEB_PREVIEW = env_bool("DISABLE_WEB_PREVIEW", True)
+
+MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(15 * 1024 * 1024)))  # 15MB
+
+SOURCES = _json_list_env("SOURCES") or [
+    "IraninArabic",
+    "iraninarabic_ir",
+    "arabic_farsnews",
+    "Tasnim_Ar",
+    "Khamenei_arabi",
+    "alalamarabic",
+    "almayadeen",
+    "Iraq_now3",
+    "mehwar_1",
+    "iraqalhadath_net",
+    "almanarnews",
+    "manarbreaking",
+    "ReutersAr",
+]
+
+DB_FILE = os.environ.get("DB_FILE", "posted.sqlite3")
+
+# -------------------------
+# Networking tuning
+# -------------------------
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "10"))
+MAX_CONCURRENT_FETCHES = int(os.environ.get("MAX_CONCURRENT_FETCHES", "6"))
+
+# =========================
+# Text cleaning: remove other channel usernames + keep ours + add ours footer
+# =========================
+def strip_external_usernames(text: str) -> str:
+    if not text:
+        return ""
+
+    t = text
+
+    # حذف @username (مع استثناء يوزرنا)
+    def _repl_at(m):
+        u = (m.group(1) or "").lower()
+        if u == _OUR_USER_PLAIN:
+            return m.group(0)
+        return ""
+
+    t = re.sub(r"@([A-Za-z0-9_]{4,32})", _repl_at, t)
+
+    # حذف روابط t.me/xxxx و t.me/s/xxxx (مع استثناء يوزرنا)
+    def _repl_tme(m):
+        u = (m.group("user") or "").lower()
+        if u == _OUR_USER_PLAIN:
+            return m.group(0)
+        return ""
+
+    t = re.sub(r"(?:https?://)?t\.me/(?:s/)?(?P<user>[A-Za-z0-9_]{4,32})(?:\S*)?", _repl_tme, t)
+
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+def append_our_signature(text: str) -> str:
+    base = (text or "").strip()
+    sig = f"\n\n—\n{BRAND_NAME}\n{OUR_USERNAME} | {CHANNEL_PUBLIC_LINK}".strip()
+
+    low = base.lower()
+    if _OUR_USER_PLAIN in low or CHANNEL_PUBLIC_LINK.lower() in low:
+        return base
+    return (base + sig) if base else sig
+
 def canonical_text_for_fp(text: str) -> str:
-    """
-    نص موحّد للـ fingerprint حتى يمنع التكرار بين القنوات:
-    - lower
-    - حذف روابط
-    - حذف رموز زائدة
-    - توحيد المسافات
-    """
     t = (text or "").strip()
     if not t:
         return ""
 
     t = t.lower()
-    # حذف الروابط
     t = re.sub(r"https?://\S+", " ", t)
-    # توحيد فواصل/رموز شائعة (اختياري)
+    t = re.sub(r"(?:https?://)?t\.me/\S+", " ", t)
+    t = re.sub(r"@([a-z0-9_]{4,32})", " ", t)
     t = re.sub(r"[“”\"'`]", " ", t)
     t = re.sub(r"[•·●♦■▶️➡️🔻🔺🔹🔸]", " ", t)
-    # توحيد مسافات
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -174,68 +255,12 @@ def media_basename(url: Optional[str]) -> str:
         return ""
 
 def content_fingerprint(text: str, media_type: Optional[str], media_url: Optional[str]) -> str:
-    """
-    ✅ يمنع تكرار نفس الخبر بين القنوات:
-    - يعتمد أساساً على النص بعد توحيده
-    - إذا ماكو نص يعتمد على اسم ملف الميديا (حل احتياطي)
-    """
     canon = canonical_text_for_fp(text)
     if canon:
         base = f"t||{canon}"
     else:
         base = f"m||{media_type or ''}||{media_basename(media_url)}"
     return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
-
-# =========================
-# Config
-# =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
-
-# ✅ يدعم float (تگدر تخليه 0.3 مثلاً)
-CHECK_EVERY_SECONDS = float(os.environ.get("CHECK_EVERY_SECONDS", "0.5"))
-
-# ⚠ إرسال أسرع جداً ممكن يسبب Flood من تيليجرام، خليه 0.15~0.3
-SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.20"))
-
-MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "50"))
-
-# نافذة "جديد" (ثواني)
-MAX_AGE_SECONDS = int(os.environ.get("MAX_AGE_SECONDS", "60"))
-
-# ✅ خليها صغيرة للسرعة (3 أسرع من 12)
-FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "3"))
-
-DISABLE_WEB_PREVIEW = env_bool("DISABLE_WEB_PREVIEW", True)
-
-MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(15 * 1024 * 1024)))  # 15MB
-
-# ✅ مصادر (أنت تقدر تستبدلها عبر ENV: SOURCES كـ JSON)
-SOURCES = _json_list_env("SOURCES") or [
-    "IraninArabic",
-    "iraninarabic_ir",
-    "arabic_farsnews",
-    "Tasnim_Ar",
-    "Khamenei_arabi",
-    "alalamarabic",
-    "almayadeen",
-    "Iraq_now3",
-    "mehwar_1",
-    "iraqalhadath_net",
-    "almanarnews",
-    "manarbreaking",
-    "ReutersAr",  # رويترز بالعربية
-]
-
-DB_FILE = os.environ.get("DB_FILE", "posted.sqlite3")
-
-# -------------------------
-# Networking tuning
-# -------------------------
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
-SESSION_TIMEOUT = 12  # أسرع
-MAX_CONCURRENT_FETCHES = int(os.environ.get("MAX_CONCURRENT_FETCHES", "6"))
 
 # =========================
 # DB (anti-duplicate)
@@ -259,7 +284,6 @@ def db_init() -> sqlite3.Connection:
 
 def already_posted(con: sqlite3.Connection, post_id: str, fp: str) -> bool:
     cur = con.cursor()
-    # ✅ افحص بالـ fp أولاً (حتى يمنع التكرار بين القنوات)
     cur.execute("SELECT 1 FROM posted WHERE fp = ?", (fp,))
     if cur.fetchone() is not None:
         return True
@@ -310,7 +334,6 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
     blocks = soup.select("div.tgme_widget_message")
     posts: List[Dict] = []
 
-    # آخر limit فقط (أسرع)
     for b in blocks[-limit:]:
         data_post = b.get("data-post")
         if not data_post:
@@ -321,10 +344,18 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
         if time_el and time_el.has_attr("datetime"):
             dt_utc = parse_iso_datetime_to_utc(time_el["datetime"])
 
+        # لا نأخذ القديم
+        if dt_utc is None or not is_fresh(dt_utc, MAX_AGE_SECONDS):
+            continue
+
         text_el = b.select_one("div.tgme_widget_message_text")
         text = text_el.get_text("\n").strip() if text_el else ""
         text = normalize_text(text)
         text = remove_hashtags_and_freq(text)
+
+        # حذف يوزرات وروابط قنوات أخرى
+        text = strip_external_usernames(text)
+        text = normalize_text(text)
 
         media_type, media_url = extract_media(b)
 
@@ -350,16 +381,16 @@ async def fetch_channel_posts(username: str, limit: int, sem: asyncio.Semaphore)
         return await asyncio.to_thread(fetch_channel_posts_sync, username, limit)
 
 # =========================
-# Message format (NO SOURCE / NO LINK / NO TIME)
+# Message format
 # =========================
 def format_pretty_text(post: Dict) -> str:
-    body = post.get("text", "") or ""
-    body = html.escape(body)
+    body = (post.get("text") or "").strip()
+    body = append_our_signature(body)
 
+    body_html = html.escape(body)
     header = "🟦 <b>خبر عاجل</b>\n"
     sep = "—" * 18
-    text = f"{header}{sep}\n{body}"
-    return text.strip()
+    return f"{header}{sep}\n{body_html}".strip()
 
 def build_caption_from_formatted(formatted_html: str) -> Tuple[str, Optional[str]]:
     if len(formatted_html) <= 900:
@@ -489,13 +520,13 @@ async def main():
     log.info(f"🎯 Target: {TARGET_CHANNEL}")
     log.info(f"📡 Sources: {len(SOURCES)} channels")
     log.info(f"⚡ Check every: {CHECK_EVERY_SECONDS}s | Fresh window: {MAX_AGE_SECONDS}s")
+    log.info(f"🏷️ Our username: {OUR_USERNAME} | Link: {CHANNEL_PUBLIC_LINK}")
 
     backoff = 0.2
     last_prune = time.time()
 
-    # ✅ تتبع آخر رسالة بكل قناة حتى نرسل فقط الجديد (سريع جداً)
+    # تتبع آخر رسالة بكل قناة حتى نرسل فقط الجديد
     last_mid: Dict[str, int] = {src: -1 for src in SOURCES}
-
     sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
     while True:
@@ -511,30 +542,23 @@ async def main():
                 if isinstance(r, Exception):
                     continue
 
-                # فقط الجديد حسب mid
                 lm = last_mid.get(src, -1)
                 for p in r:
                     mid = p.get("mid", -1)
                     if mid > lm:
                         new_posts.append(p)
 
-                # حدّث آخر mid بأعلى قيمة شفناها
                 max_mid_here = max([p.get("mid", -1) for p in r], default=lm)
                 if max_mid_here > lm:
                     last_mid[src] = max_mid_here
 
-            # رتب الجديد حسب الوقت/المعرف
             new_posts.sort(key=lambda x: (x.get("dt_utc") or now_utc(), x.get("mid", -1)))
 
             for p in new_posts:
                 if sent_this_cycle >= MAX_POSTS_PER_CYCLE:
                     break
 
-                # خيار إضافي: لو تريد تعتمد على "fresh window" أيضاً
-                dt_ok = True
-                if p.get("dt_utc") is not None:
-                    dt_ok = is_fresh(p.get("dt_utc"), MAX_AGE_SECONDS)
-                if not dt_ok:
+                if not is_fresh(p.get("dt_utc"), MAX_AGE_SECONDS):
                     continue
 
                 fp = content_fingerprint(p.get("text", ""), p.get("media_type"), p.get("media_url"))
