@@ -11,6 +11,7 @@ import asyncio
 import threading
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Tuple
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -32,11 +33,19 @@ def start_health_server():
     port = int(os.environ.get("PORT", "8000"))
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
+        def _send_ok_headers(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
+
+        def do_GET(self):
+            self._send_ok_headers()
             self.wfile.write(b"OK")
+
+        def do_HEAD(self):
+            # مهم حتى ما يطلع 501 عند UptimeRobot
+            self._send_ok_headers()
 
         def log_message(self, format, *args):
             return
@@ -124,8 +133,57 @@ def is_fresh(dt_utc: Optional[datetime], max_age_seconds: int) -> bool:
     age = (now_utc() - dt_utc).total_seconds()
     return 0 <= age <= max_age_seconds
 
-def content_fingerprint(text: str, media_url: Optional[str]) -> str:
-    base = (text or "").strip() + "||" + (media_url or "")
+def parse_post_id(data_post: str) -> Tuple[str, int]:
+    # "channel/123" -> ("channel", 123)
+    try:
+        ch, mid = data_post.split("/", 1)
+        return ch, int(mid)
+    except Exception:
+        return "", -1
+
+def canonical_text_for_fp(text: str) -> str:
+    """
+    نص موحّد للـ fingerprint حتى يمنع التكرار بين القنوات:
+    - lower
+    - حذف روابط
+    - حذف رموز زائدة
+    - توحيد المسافات
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    t = t.lower()
+    # حذف الروابط
+    t = re.sub(r"https?://\S+", " ", t)
+    # توحيد فواصل/رموز شائعة (اختياري)
+    t = re.sub(r"[“”\"'`]", " ", t)
+    t = re.sub(r"[•·●♦■▶️➡️🔻🔺🔹🔸]", " ", t)
+    # توحيد مسافات
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def media_basename(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    try:
+        p = urlparse(url)
+        name = (p.path or "").split("/")[-1]
+        return name or ""
+    except Exception:
+        return ""
+
+def content_fingerprint(text: str, media_type: Optional[str], media_url: Optional[str]) -> str:
+    """
+    ✅ يمنع تكرار نفس الخبر بين القنوات:
+    - يعتمد أساساً على النص بعد توحيده
+    - إذا ماكو نص يعتمد على اسم ملف الميديا (حل احتياطي)
+    """
+    canon = canonical_text_for_fp(text)
+    if canon:
+        base = f"t||{canon}"
+    else:
+        base = f"m||{media_type or ''}||{media_basename(media_url)}"
     return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
 
 # =========================
@@ -134,39 +192,50 @@ def content_fingerprint(text: str, media_url: Optional[str]) -> str:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
 
-CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "1"))
-SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.30"))
-MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "30"))
+# ✅ يدعم float (تگدر تخليه 0.3 مثلاً)
+CHECK_EVERY_SECONDS = float(os.environ.get("CHECK_EVERY_SECONDS", "0.5"))
 
+# ⚠ إرسال أسرع جداً ممكن يسبب Flood من تيليجرام، خليه 0.15~0.3
+SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.20"))
+
+MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "50"))
+
+# نافذة "جديد" (ثواني)
 MAX_AGE_SECONDS = int(os.environ.get("MAX_AGE_SECONDS", "60"))
-FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "12"))
+
+# ✅ خليها صغيرة للسرعة (3 أسرع من 12)
+FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "3"))
+
 DISABLE_WEB_PREVIEW = env_bool("DISABLE_WEB_PREVIEW", True)
 
-MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(15 * 1024 * 1024)))  # 15MB افتراضيًا
+MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(15 * 1024 * 1024)))  # 15MB
 
 # ✅ مصادر (أنت تقدر تستبدلها عبر ENV: SOURCES كـ JSON)
-# ملاحظة: لا يوجد قنوات روسية هنا.
 SOURCES = _json_list_env("SOURCES") or [
-    # إيران بالعربي / إعلام قريب من إيران
     "IraninArabic",
     "iraninarabic_ir",
     "arabic_farsnews",
     "Tasnim_Ar",
     "Khamenei_arabi",
-
-    # ✅ قناة العالم - عاجل
     "alalamarabic",
-
-    # محور قريب من إيران (إعلامي)
     "almayadeen",
-		"Iraq_now3",
-		"mehwar_1",
-		"iraqalhadath_net",
+    "Iraq_now3",
+    "mehwar_1",
+    "iraqalhadath_net",
     "almanarnews",
     "manarbreaking",
+    "ReutersAr",  # رويترز بالعربية
 ]
 
 DB_FILE = os.environ.get("DB_FILE", "posted.sqlite3")
+
+# -------------------------
+# Networking tuning
+# -------------------------
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+SESSION_TIMEOUT = 12  # أسرع
+MAX_CONCURRENT_FETCHES = int(os.environ.get("MAX_CONCURRENT_FETCHES", "6"))
 
 # =========================
 # DB (anti-duplicate)
@@ -190,10 +259,11 @@ def db_init() -> sqlite3.Connection:
 
 def already_posted(con: sqlite3.Connection, post_id: str, fp: str) -> bool:
     cur = con.cursor()
-    cur.execute("SELECT 1 FROM posted WHERE post_id = ?", (post_id,))
+    # ✅ افحص بالـ fp أولاً (حتى يمنع التكرار بين القنوات)
+    cur.execute("SELECT 1 FROM posted WHERE fp = ?", (fp,))
     if cur.fetchone() is not None:
         return True
-    cur.execute("SELECT 1 FROM posted WHERE fp = ?", (fp,))
+    cur.execute("SELECT 1 FROM posted WHERE post_id = ?", (post_id,))
     return cur.fetchone() is not None
 
 def mark_posted(con: sqlite3.Connection, post_id: str, fp: str):
@@ -212,10 +282,6 @@ def prune_old(con: sqlite3.Connection, keep_seconds: int = 7 * 24 * 3600):
 # =========================
 # Fetch from t.me/s/<channel>
 # =========================
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
-SESSION_TIMEOUT = 20
-
 def extract_media(block) -> Tuple[Optional[str], Optional[str]]:
     photo_wrap = block.select_one("a.tgme_widget_message_photo_wrap")
     if photo_wrap:
@@ -244,6 +310,7 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
     blocks = soup.select("div.tgme_widget_message")
     posts: List[Dict] = []
 
+    # آخر limit فقط (أسرع)
     for b in blocks[-limit:]:
         data_post = b.get("data-post")
         if not data_post:
@@ -264,8 +331,11 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
         if not text and not media_url:
             continue
 
+        _, mid = parse_post_id(data_post)
+
         posts.append({
             "id": data_post,
+            "mid": mid,
             "src": username,
             "dt_utc": dt_utc,
             "text": text,
@@ -275,8 +345,9 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
 
     return posts
 
-async def fetch_channel_posts(username: str, limit: int) -> List[Dict]:
-    return await asyncio.to_thread(fetch_channel_posts_sync, username, limit)
+async def fetch_channel_posts(username: str, limit: int, sem: asyncio.Semaphore) -> List[Dict]:
+    async with sem:
+        return await asyncio.to_thread(fetch_channel_posts_sync, username, limit)
 
 # =========================
 # Message format (NO SOURCE / NO LINK / NO TIME)
@@ -419,29 +490,54 @@ async def main():
     log.info(f"📡 Sources: {len(SOURCES)} channels")
     log.info(f"⚡ Check every: {CHECK_EVERY_SECONDS}s | Fresh window: {MAX_AGE_SECONDS}s")
 
-    backoff = 1
+    backoff = 0.2
     last_prune = time.time()
+
+    # ✅ تتبع آخر رسالة بكل قناة حتى نرسل فقط الجديد (سريع جداً)
+    last_mid: Dict[str, int] = {src: -1 for src in SOURCES}
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
     while True:
         sent_this_cycle = 0
         try:
-            tasks = [fetch_channel_posts(src, FETCH_LIMIT_PER_SOURCE) for src in SOURCES]
+            tasks = [fetch_channel_posts(src, FETCH_LIMIT_PER_SOURCE, sem) for src in SOURCES]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            all_posts: List[Dict] = []
-            for r in results:
+            new_posts: List[Dict] = []
+
+            for idx, r in enumerate(results):
+                src = SOURCES[idx]
                 if isinstance(r, Exception):
                     continue
-                all_posts.extend(r)
 
-            fresh_posts = [p for p in all_posts if is_fresh(p.get("dt_utc"), MAX_AGE_SECONDS)]
-            fresh_posts.sort(key=lambda x: x.get("dt_utc") or now_utc())
+                # فقط الجديد حسب mid
+                lm = last_mid.get(src, -1)
+                for p in r:
+                    mid = p.get("mid", -1)
+                    if mid > lm:
+                        new_posts.append(p)
 
-            for p in fresh_posts:
+                # حدّث آخر mid بأعلى قيمة شفناها
+                max_mid_here = max([p.get("mid", -1) for p in r], default=lm)
+                if max_mid_here > lm:
+                    last_mid[src] = max_mid_here
+
+            # رتب الجديد حسب الوقت/المعرف
+            new_posts.sort(key=lambda x: (x.get("dt_utc") or now_utc(), x.get("mid", -1)))
+
+            for p in new_posts:
                 if sent_this_cycle >= MAX_POSTS_PER_CYCLE:
                     break
 
-                fp = content_fingerprint(p.get("text", ""), p.get("media_url"))
+                # خيار إضافي: لو تريد تعتمد على "fresh window" أيضاً
+                dt_ok = True
+                if p.get("dt_utc") is not None:
+                    dt_ok = is_fresh(p.get("dt_utc"), MAX_AGE_SECONDS)
+                if not dt_ok:
+                    continue
+
+                fp = content_fingerprint(p.get("text", ""), p.get("media_type"), p.get("media_url"))
                 if already_posted(con, p["id"], fp):
                     continue
 
@@ -450,14 +546,14 @@ async def main():
                     mark_posted(con, p["id"], fp)
                     sent_this_cycle += 1
 
-            backoff = 1
+            backoff = 0.2
 
         except TelegramError as e:
             log.warning(f"TELEGRAM error: {e}")
-            backoff = min(backoff * 2, 30)
+            backoff = min(backoff * 2, 5)
         except Exception as e:
             log.exception(f"Unexpected error: {e}")
-            backoff = min(backoff * 2, 30)
+            backoff = min(backoff * 2, 5)
 
         if time.time() - last_prune > 6 * 3600:
             try:
