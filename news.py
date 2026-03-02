@@ -3,6 +3,7 @@ import re
 import time
 import json
 import html
+import io
 import hashlib
 import logging
 import sqlite3
@@ -104,7 +105,7 @@ TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
 
 # ✅ سريع جداً
 CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "1"))          # افتراضي 1 ثانية
-SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.25"))     # لا تقللها كثير حتى لا يصير Flood
+SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.30"))     # زيادة بسيطة لتقليل Flood
 MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "30"))
 
 # ✅ فقط أقل من دقيقة
@@ -115,9 +116,11 @@ FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "12"))
 
 DISABLE_WEB_PREVIEW = env_bool("DISABLE_WEB_PREVIEW", True)
 
+# حدود تحميل الميديا (حتى ما يطيح السيرفر بسبب فيديوهات كبيرة)
+MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(20 * 1024 * 1024)))  # 20MB افتراضيًا
+
 # مصادر (تقدر تزوّدها من ENV: SOURCES كـ JSON)
 SOURCES = _json_list_env("SOURCES") or [
-    # إيراني/عربي
     "IraninArabic",
     "iraninarabic_ir",
     "arabic_farsnews",
@@ -125,7 +128,6 @@ SOURCES = _json_list_env("SOURCES") or [
     "alalamarabic",
     "Khamenei_arabi",
 
-    # عربي (كبيرة ومعروفة)
     "almayadeen",
     "almanarnews",
     "ajanews",
@@ -134,7 +136,6 @@ SOURCES = _json_list_env("SOURCES") or [
     "AlarabyTelevision",
     "RTarabic_br",
 
-    # قنوات عراق/عربي إضافية
     "Iraq_now3",
     "iraqalhadath_net",
     "mehwar_1",
@@ -227,13 +228,11 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
         if not data_post:
             continue
 
-        # datetime
         dt_utc = None
         time_el = b.select_one("a.tgme_widget_message_date time")
         if time_el and time_el.has_attr("datetime"):
             dt_utc = parse_iso_datetime_to_utc(time_el["datetime"])
 
-        # text
         text_el = b.select_one("div.tgme_widget_message_text")
         text = text_el.get_text("\n").strip() if text_el else ""
         text = normalize_text(text)
@@ -245,7 +244,7 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
 
         posts.append({
             "id": data_post,
-            "src": username,        # نخليه داخلي فقط (ما ننشره)
+            "src": username,  # داخلي فقط
             "dt_utc": dt_utc,
             "text": text,
             "media_type": media_type,
@@ -258,38 +257,22 @@ async def fetch_channel_posts(username: str, limit: int) -> List[Dict]:
     return await asyncio.to_thread(fetch_channel_posts_sync, username, limit)
 
 # =========================
-# Pretty message format (NO SOURCE)
+# Message format (NO SOURCE / NO LINK / NO TIME)
 # =========================
-def build_post_link(data_post: str) -> str:
-    try:
-        ch, mid = data_post.split("/", 1)
-        return f"https://t.me/{ch}/{mid}"
-    except Exception:
-        return ""
-
 def format_pretty_text(post: Dict) -> str:
     """
-    ✅ شكل جميل بدون ذكر المصدر نهائياً.
+    ✅ شكل جميل: عنوان + النص فقط (بدون وقت/رابط/مصدر).
     """
-    link = build_post_link(post.get("id", ""))
-    dt = post.get("dt_utc")
-    dt_txt = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else ""
-
     body = post.get("text", "") or ""
     body = html.escape(body)
 
     header = "🟦 <b>خبر عاجل</b>\n"
-    meta = ""
-    if dt_txt:
-        meta += f"🕒 <b>الوقت:</b> {html.escape(dt_txt)}\n"
-    if link:
-        meta += f"🔗 <b>الرابط:</b> <a href=\"{html.escape(link)}\">اضغط هنا</a>\n"
-
     sep = "—" * 18
-    text = f"{header}{meta}{sep}\n{body}"
+    text = f"{header}{sep}\n{body}"
     return text.strip()
 
 def build_caption_from_formatted(formatted_html: str) -> Tuple[str, Optional[str]]:
+    # كابشن الميديا 1024؛ نخلي هامش
     if len(formatted_html) <= 900:
         return formatted_html, None
     cap = formatted_html[:900].rstrip() + "…"
@@ -297,6 +280,32 @@ def build_caption_from_formatted(formatted_html: str) -> Tuple[str, Optional[str
     if extra:
         extra = "…" + extra
     return cap, extra
+
+# =========================
+# Download media (to avoid Telegram "Wrong type of web page content")
+# =========================
+def download_media_bytes(url: str) -> Optional[io.BytesIO]:
+    """
+    يحمل الميديا داخل الذاكرة بحد أقصى MAX_MEDIA_BYTES.
+    """
+    try:
+        with requests.get(url, timeout=20, stream=True) as r:
+            r.raise_for_status()
+            total = 0
+            buf = io.BytesIO()
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_MEDIA_BYTES:
+                    log.warning(f"Media too large ({total} bytes), skipping download.")
+                    return None
+                buf.write(chunk)
+            buf.seek(0)
+            return buf
+    except Exception as e:
+        log.warning(f"Download failed: {e}")
+        return None
 
 # =========================
 # Telegram send helpers
@@ -331,6 +340,7 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
     media_type = post.get("media_type")
     media_url = post.get("media_url")
 
+    # Text only
     if not media_type or not media_url:
         if not formatted:
             return False
@@ -339,19 +349,34 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
 
     caption, extra = build_caption_from_formatted(formatted)
 
-    if media_type == "photo":
-        await bot.send_photo(chat_id=chat_id, photo=media_url, caption=caption, parse_mode="HTML")
-    elif media_type == "video":
-        await bot.send_video(
-            chat_id=chat_id,
-            video=media_url,
-            caption=caption,
-            parse_mode="HTML",
-            supports_streaming=True
-        )
-    else:
+    # Download first then send as file to avoid Telegram URL issues
+    file_obj = await asyncio.to_thread(download_media_bytes, media_url)
+    if not file_obj:
+        # fallback to text only
         await send_text_html(bot, chat_id, formatted)
         return True
+
+    try:
+        if media_type == "photo":
+            file_obj.name = "photo.jpg"
+            await bot.send_photo(chat_id=chat_id, photo=file_obj, caption=caption, parse_mode="HTML")
+        elif media_type == "video":
+            file_obj.name = "video.mp4"
+            await bot.send_video(
+                chat_id=chat_id,
+                video=file_obj,
+                caption=caption,
+                parse_mode="HTML",
+                supports_streaming=True
+            )
+        else:
+            await send_text_html(bot, chat_id, formatted)
+            return True
+    finally:
+        try:
+            file_obj.close()
+        except Exception:
+            pass
 
     await asyncio.sleep(SLEEP_BETWEEN_SENDS)
     if extra:
