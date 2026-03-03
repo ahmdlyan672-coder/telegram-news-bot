@@ -77,6 +77,9 @@ def env_bool(name: str, default: bool = False) -> bool:
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def day_key_utc() -> str:
+    return now_utc().strftime("%Y-%m-%d")
+
 def parse_iso_datetime_to_utc(s: str) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(s)
@@ -97,7 +100,6 @@ def normalize_text(text: str) -> str:
 def remove_hashtags_and_freq(text: str) -> str:
     if not text:
         return ""
-
     t = text
 
     # حذف سطور فيها كلمة "تردد" أو "ترددات"
@@ -134,35 +136,51 @@ def parse_post_id(data_post: str) -> Tuple[str, int]:
     except Exception:
         return "", -1
 
+def stable_pick(seq: List[str], key: str) -> str:
+    if not seq:
+        return ""
+    h = hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()
+    idx = int(h[:8], 16) % len(seq)
+    return seq[idx]
+
 # =========================
-# Config (ثابتة حسب طلبك)
+# Config
 # =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
 
-OUR_USERNAME = "@newssokl"
-_OUR_USER_PLAIN = "newssokl"
+OUR_USERNAME = os.environ.get("OUR_USERNAME", "@newssokl").strip()
+_OUR_USER_PLAIN = OUR_USERNAME.lstrip("@").lower()
 
-# ✅ لم نعد نستخدم رابط القناة داخل التوقيع
 BRAND_NAME = os.environ.get("BRAND_NAME", "اخبار المرصد").strip()
 
-# ✅ بحث كل 10 ثواني
-CHECK_EVERY_SECONDS = 10
+# ✅ سريع بس مو سبام
+CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "10"))
 
-# إرسال سريع (انتبه من Flood)
-SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.15"))
+# ✅ آمن ضد Flood
+SLEEP_BETWEEN_SENDS = float(os.environ.get("SLEEP_BETWEEN_SENDS", "0.4"))
 
-MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "50"))
+# ✅ لا تنشر أكثر من هذا بكل دورة
+MAX_POSTS_PER_CYCLE = int(os.environ.get("MAX_POSTS_PER_CYCLE", "12"))
 
-# ✅ أي خبر عمره أكثر من 60 ثانية لا ينشر
-MAX_AGE_SECONDS = 60
+# ✅ نافذة حداثة أكبر حتى ما يفوتك خبر (5 دقائق)
+MAX_AGE_SECONDS = int(os.environ.get("MAX_AGE_SECONDS", "300"))
 
-# ✅ خليها صغيرة للسرعة
-FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "3"))
+# ✅ نجلب أكثر حتى نختار (لكن نشرنا محدود)
+FETCH_LIMIT_PER_SOURCE = int(os.environ.get("FETCH_LIMIT_PER_SOURCE", "10"))
 
 DISABLE_WEB_PREVIEW = env_bool("DISABLE_WEB_PREVIEW", True)
-
 MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(15 * 1024 * 1024)))  # 15MB
+
+# ✅ سقف يومي للنشر (افتراضي 35)
+DAILY_POST_LIMIT = int(os.environ.get("DAILY_POST_LIMIT", "35"))
+
+# ✅ ملخص دوري لغير العاجل (افتراضي 15 دقيقة)
+DIGEST_EVERY_SECONDS = int(os.environ.get("DIGEST_EVERY_SECONDS", "900"))
+DIGEST_MAX_ITEMS = int(os.environ.get("DIGEST_MAX_ITEMS", "12"))
+
+# CTA خفيف (اختياري)
+CTA_EVERY_N_POSTS = int(os.environ.get("CTA_EVERY_N_POSTS", "8"))
 
 SOURCES = _json_list_env("SOURCES") or [
     "IraninArabic",
@@ -191,7 +209,81 @@ SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "10"))
 MAX_CONCURRENT_FETCHES = int(os.environ.get("MAX_CONCURRENT_FETCHES", "6"))
 
 # =========================
-# Text cleaning: remove other channel usernames + keep ours + add ours footer
+# Urgent detection + smart rewriting (no meaning change)
+# =========================
+URGENT_WORDS = [
+    "عاجل", "الآن", "قصف", "انفجار", "صاروخ", "استهداف", "اغتيال", "اشتباكات",
+    "غارات", "تحذير", "إغلاق", "هجوم", "اعتراض", "زلزال", "حريق"
+]
+
+URGENT_HEADERS = [
+    "🟥 <b>عاجل</b>",
+    "🟧 <b>تطور جديد</b>",
+    "🟦 <b>خبر مهم</b>",
+]
+
+UPDATE_LEADS = [
+    "📍 تحديث:",
+    "📌 التفاصيل:",
+    "🔎 متابعة:",
+    "🗞️ أفادت المصادر:",
+]
+
+def is_urgent(text: str) -> bool:
+    t = text or ""
+    return any(w in t for w in URGENT_WORDS)
+
+def smart_clean(text: str) -> str:
+    """
+    تغيير ذكي = تنسيق + إزالة زوائد + تقصير حشو.
+    لا يغير المعنى.
+    """
+    t = normalize_text(text)
+    t = remove_hashtags_and_freq(t)
+
+    # إزالة تكرار الرموز/الإيموجي بشكل مبالغ
+    t = re.sub(r"(🟥|🟦|🟧|🔴|🚨){2,}", r"\1", t)
+
+    # توحيد الفراغات
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
+    # لو النص طويل: نخليه مركز (بدون تحريف)
+    if len(t) > 700:
+        t = t[:680].rstrip() + "…"
+
+    # لو يبدأ بـ "عاجل |" أو "عاجل:" إلخ، نشيلها لأن احنا نضيف هيدر
+    t = re.sub(r"^\s*(عاجل|عاجل جداً|عاجل جدا)\s*[\|\:\-–—]+\s*", "", t, flags=re.IGNORECASE).strip()
+
+    return t
+
+def add_lead_line(text: str, key: str) -> str:
+    """
+    نضيف سطر مقدمة متغير (بدون تغيير الخبر)
+    """
+    lead = stable_pick(UPDATE_LEADS, key)
+    # إذا النص أصلاً يبدأ بمقدمة مشابهة، لا نكرر
+    if text.startswith(("📍", "📌", "🔎", "🗞️")):
+        return text
+    return f"{lead} {text}".strip()
+
+def append_signature_and_cta(text: str, attach_cta: bool) -> str:
+    base = (text or "").strip()
+
+    # توقيع ثابت
+    sig = f"\n\n—\n{BRAND_NAME}\n{OUR_USERNAME}".strip()
+
+    # CTA خفيف (اختياري)
+    if attach_cta:
+        sig = f"\n\n—\n📌 لمتابعة التنبيهات فعّل الإشعارات 🔔\n{BRAND_NAME}\n{OUR_USERNAME}".strip()
+
+    low = base.lower()
+    if _OUR_USER_PLAIN in low:
+        return base
+    return (base + sig) if base else sig
+
+# =========================
+# Text cleaning: remove other channel usernames + keep ours
 # =========================
 def strip_external_usernames(text: str) -> str:
     if not text:
@@ -221,21 +313,10 @@ def strip_external_usernames(text: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
-def append_our_signature(text: str) -> str:
-    base = (text or "").strip()
-    # ✅ التوقيع: فقط اسم البراند + اليوزر (بدون رابط)
-    sig = f"\n\n—\n{BRAND_NAME}\n{OUR_USERNAME}".strip()
-
-    low = base.lower()
-    if _OUR_USER_PLAIN in low:
-        return base
-    return (base + sig) if base else sig
-
 def canonical_text_for_fp(text: str) -> str:
     t = (text or "").strip()
     if not t:
         return ""
-
     t = t.lower()
     t = re.sub(r"https?://\S+", " ", t)
     t = re.sub(r"(?:https?://)?t\.me/\S+", " ", t)
@@ -264,7 +345,7 @@ def content_fingerprint(text: str, media_type: Optional[str], media_url: Optiona
     return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
 
 # =========================
-# DB (anti-duplicate)
+# DB (anti-duplicate + queued/sent)
 # =========================
 def db_init() -> sqlite3.Connection:
     con = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -275,7 +356,8 @@ def db_init() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS posted (
             post_id TEXT PRIMARY KEY,
             fp TEXT,
-            ts INTEGER
+            ts INTEGER,
+            status TEXT
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_posted_ts ON posted(ts)")
@@ -283,7 +365,7 @@ def db_init() -> sqlite3.Connection:
     con.commit()
     return con
 
-def already_posted(con: sqlite3.Connection, post_id: str, fp: str) -> bool:
+def already_seen(con: sqlite3.Connection, post_id: str, fp: str) -> bool:
     cur = con.cursor()
     cur.execute("SELECT 1 FROM posted WHERE fp = ?", (fp,))
     if cur.fetchone() is not None:
@@ -291,11 +373,11 @@ def already_posted(con: sqlite3.Connection, post_id: str, fp: str) -> bool:
     cur.execute("SELECT 1 FROM posted WHERE post_id = ?", (post_id,))
     return cur.fetchone() is not None
 
-def mark_posted(con: sqlite3.Connection, post_id: str, fp: str):
+def mark_seen(con: sqlite3.Connection, post_id: str, fp: str, status: str):
     cur = con.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO posted(post_id, fp, ts) VALUES(?, ?, ?)",
-        (post_id, fp, int(time.time()))
+        "INSERT OR REPLACE INTO posted(post_id, fp, ts, status) VALUES(?, ?, ?, ?)",
+        (post_id, fp, int(time.time()), status)
     )
     con.commit()
 
@@ -352,9 +434,9 @@ def fetch_channel_posts_sync(username: str, limit: int) -> List[Dict]:
         text_el = b.select_one("div.tgme_widget_message_text")
         text = text_el.get_text("\n").strip() if text_el else ""
         text = normalize_text(text)
-        text = remove_hashtags_and_freq(text)
 
-        # حذف يوزرات وروابط قنوات أخرى
+        # تنظيفات
+        text = remove_hashtags_and_freq(text)
         text = strip_external_usernames(text)
         text = normalize_text(text)
 
@@ -382,36 +464,60 @@ async def fetch_channel_posts(username: str, limit: int, sem: asyncio.Semaphore)
         return await asyncio.to_thread(fetch_channel_posts_sync, username, limit)
 
 # =========================
-# Message format
+# Message formatting
 # =========================
-def format_pretty_text(post: Dict) -> str:
-    body = (post.get("text") or "").strip()
-    body = append_our_signature(body)
+def format_urgent_html(post: Dict, attach_cta: bool) -> str:
+    src = post.get("src", "")
+    base_text = smart_clean(post.get("text", ""))
 
-    body_html = html.escape(body)
-    header = "🟦 <b>خبر عاجل</b>\n"
+    # مقدمة متغيرة حسب الخبر
+    key = f"urgent|{src}|{post.get('id','')}"
+    base_text = add_lead_line(base_text, key)
+
+    base_text = append_signature_and_cta(base_text, attach_cta=attach_cta)
+
+    header = stable_pick(URGENT_HEADERS, key)
     sep = "—" * 18
-    return f"{header}{sep}\n{body_html}".strip()
+    return f"{header}\n{sep}\n{html.escape(base_text)}".strip()
 
-# ✅✅ FIX: لا ترسل extra أبداً، وخلي التوقيع دائماً داخل الكابتشن حتى لو قصّينا
+def format_digest_html(items: List[Dict], attach_cta: bool) -> str:
+    # ملخص: نقاط قصيرة بدون حشو
+    lines = []
+    for it in items[-DIGEST_MAX_ITEMS:]:
+        t = smart_clean(it.get("text", ""))
+        t = re.sub(r"\s+", " ", t).strip()
+        if len(t) > 160:
+            t = t[:159] + "…"
+        if t:
+            lines.append("• " + t)
+
+    if not lines:
+        return ""
+
+    key = f"digest|{int(time.time()//DIGEST_EVERY_SECONDS)}"
+    header = "🟩 <b>ملخص سريع</b>"
+    sep = "—" * 18
+
+    body = "\n".join(lines)
+    body = append_signature_and_cta(body, attach_cta=attach_cta)
+    return f"{header}\n{sep}\n{html.escape(body)}".strip()
+
 def build_caption_from_formatted(formatted_html: str) -> str:
     MAX_CAPTION = 900
     s = (formatted_html or "").strip()
     if len(s) <= MAX_CAPTION:
         return s
 
-    # ✅ نحاول نثبت "كتلة التوقيع" داخل الكابتشن دائماً (اليوزر فقط)
     sig_key = html.escape(f"{OUR_USERNAME}")
     idx = s.rfind(sig_key)
 
     tail = ""
     if idx != -1:
-        # نأخذ من خط الفاصل "—" إلى النهاية (حتى يبقى التوقيع كامل)
         start = s.rfind("—", 0, idx)
         if start != -1:
             tail = s[start:].strip()
         else:
-            tail = s[max(0, idx - 120):].strip()
+            tail = s[max(0, idx - 140):].strip()
 
     if tail and len(tail) < MAX_CAPTION - 50:
         head_limit = MAX_CAPTION - len(tail) - 2
@@ -474,24 +580,22 @@ async def send_text_html(bot: Bot, chat_id: str, html_text: str):
         )
         await asyncio.sleep(SLEEP_BETWEEN_SENDS)
 
-async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
-    formatted = format_pretty_text(post)
+async def send_post(bot: Bot, chat_id: str, post: Dict, html_text: str) -> bool:
+    if not html_text:
+        return False
 
     media_type = post.get("media_type")
     media_url = post.get("media_url")
 
     if not media_type or not media_url:
-        if not formatted:
-            return False
-        await send_text_html(bot, chat_id, formatted)
+        await send_text_html(bot, chat_id, html_text)
         return True
 
-    # ✅ هنا صار الكابتشن يرجع نص واحد فقط (بدون extra)
-    caption = build_caption_from_formatted(formatted)
+    caption = build_caption_from_formatted(html_text)
 
     file_obj = await asyncio.to_thread(download_media_bytes, media_url)
     if not file_obj:
-        await send_text_html(bot, chat_id, formatted)
+        await send_text_html(bot, chat_id, html_text)
         return True
 
     try:
@@ -508,7 +612,7 @@ async def send_post(bot: Bot, chat_id: str, post: Dict) -> bool:
                 supports_streaming=True
             )
         else:
-            await send_text_html(bot, chat_id, formatted)
+            await send_text_html(bot, chat_id, html_text)
             return True
     finally:
         try:
@@ -538,17 +642,42 @@ async def main():
     log.info(f"📡 Sources: {len(SOURCES)} channels")
     log.info(f"⚡ Check every: {CHECK_EVERY_SECONDS}s | Fresh window: {MAX_AGE_SECONDS}s")
     log.info(f"🏷️ Our username: {OUR_USERNAME}")
+    log.info(f"📌 Daily limit: {DAILY_POST_LIMIT} | Digest every: {DIGEST_EVERY_SECONDS}s")
 
-    backoff = 0.2
+    backoff = 0.4
     last_prune = time.time()
 
-    # تتبع آخر رسالة بكل قناة حتى نرسل فقط الجديد
     last_mid: Dict[str, int] = {src: -1 for src in SOURCES}
     sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+
+    # digest queue
+    digest_bucket: List[Dict] = []
+    last_digest_sent = time.time()
+
+    # daily limit
+    today = day_key_utc()
+    posted_today = 0
+
+    # CTA counter
+    posts_since_cta = 0
 
     while True:
         sent_this_cycle = 0
         try:
+            # reset day
+            new_day = day_key_utc()
+            if new_day != today:
+                today = new_day
+                posted_today = 0
+                posts_since_cta = 0
+                digest_bucket.clear()
+                log.info("🗓️ New day: counters reset.")
+
+            # لو وصل السقف اليومي: نوقف نشر وننتظر
+            if posted_today >= DAILY_POST_LIMIT:
+                await asyncio.sleep(60)
+                continue
+
             tasks = [fetch_channel_posts(src, FETCH_LIMIT_PER_SOURCE, sem) for src in SOURCES]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -572,29 +701,63 @@ async def main():
             new_posts.sort(key=lambda x: (x.get("dt_utc") or now_utc(), x.get("mid", -1)))
 
             for p in new_posts:
+                if posted_today >= DAILY_POST_LIMIT:
+                    break
                 if sent_this_cycle >= MAX_POSTS_PER_CYCLE:
                     break
-
                 if not is_fresh(p.get("dt_utc"), MAX_AGE_SECONDS):
                     continue
 
                 fp = content_fingerprint(p.get("text", ""), p.get("media_type"), p.get("media_url"))
-                if already_posted(con, p["id"], fp):
+                if already_seen(con, p["id"], fp):
                     continue
 
-                ok = await send_post(bot, TARGET_CHANNEL, p)
-                if ok:
-                    mark_posted(con, p["id"], fp)
-                    sent_this_cycle += 1
+                # ✅ عاجل: ينشر فوراً
+                if is_urgent(p.get("text", "")):
+                    attach_cta = (posts_since_cta >= CTA_EVERY_N_POSTS)
+                    html_text = format_urgent_html(p, attach_cta=attach_cta)
 
-            backoff = 0.2
+                    ok = await send_post(bot, TARGET_CHANNEL, p, html_text=html_text)
+                    if ok:
+                        mark_seen(con, p["id"], fp, status="sent")
+                        sent_this_cycle += 1
+                        posted_today += 1
+                        posts_since_cta = 0 if attach_cta else (posts_since_cta + 1)
+                    else:
+                        # لو ما انرسل لأي سبب: ما نعلمه seen حتى لا يضيع
+                        pass
+                else:
+                    # ✅ غير عاجل: نضيفه للملخص (بدون نشر فوري)
+                    digest_bucket.append(p)
+                    mark_seen(con, p["id"], fp, status="queued")
+
+            # ✅ إرسال الملخص كل فترة
+            if time.time() - last_digest_sent >= DIGEST_EVERY_SECONDS:
+                if digest_bucket and posted_today < DAILY_POST_LIMIT:
+                    # ناخذ الأحدث
+                    digest_bucket.sort(key=lambda x: (x.get("dt_utc") or now_utc(), x.get("mid", -1)))
+                    batch = digest_bucket[-DIGEST_MAX_ITEMS:]
+
+                    attach_cta = (posts_since_cta >= CTA_EVERY_N_POSTS)
+                    digest_html = format_digest_html(batch, attach_cta=attach_cta)
+
+                    if digest_html:
+                        await send_text_html(bot, TARGET_CHANNEL, digest_html)
+                        posted_today += 1
+                        posts_since_cta = 0 if attach_cta else (posts_since_cta + 1)
+
+                    digest_bucket.clear()
+
+                last_digest_sent = time.time()
+
+            backoff = 0.4
 
         except TelegramError as e:
             log.warning(f"TELEGRAM error: {e}")
-            backoff = min(backoff * 2, 5)
+            backoff = min(backoff * 2, 8)
         except Exception as e:
             log.exception(f"Unexpected error: {e}")
-            backoff = min(backoff * 2, 5)
+            backoff = min(backoff * 2, 8)
 
         if time.time() - last_prune > 6 * 3600:
             try:
