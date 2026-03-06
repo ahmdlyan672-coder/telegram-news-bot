@@ -152,7 +152,7 @@ TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "@newssokl").strip()
 OUR_USERNAME = os.environ.get("OUR_USERNAME", "@newssokl").strip()
 _OUR_USER_PLAIN = OUR_USERNAME.lstrip("@").lower()
 
-BRAND_NAME = os.environ.get("BRAND_NAME", "اخبار المرصد").strip()
+BRAND_NAME = os.environ.get("BRAND_NAME", "").strip()
 
 # ✅ سريع بس مو سبام
 CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "10"))
@@ -173,14 +173,16 @@ DISABLE_WEB_PREVIEW = env_bool("DISABLE_WEB_PREVIEW", True)
 MAX_MEDIA_BYTES = int(os.environ.get("MAX_MEDIA_BYTES", str(15 * 1024 * 1024)))  # 15MB
 
 # ✅ سقف يومي للنشر (افتراضي 35)
-DAILY_POST_LIMIT = int(os.environ.get("DAILY_POST_LIMIT", "35"))
+DAILY_POST_LIMIT = int(os.environ.get("DAILY_POST_LIMIT", "0"))
 
 # ✅ ملخص دوري لغير العاجل (افتراضي 15 دقيقة)
-DIGEST_EVERY_SECONDS = int(os.environ.get("DIGEST_EVERY_SECONDS", "900"))
+DIGEST_EVERY_SECONDS = int(os.environ.get("DIGEST_EVERY_SECONDS", "180"))
 DIGEST_MAX_ITEMS = int(os.environ.get("DIGEST_MAX_ITEMS", "12"))
 
 # CTA خفيف (اختياري)
 CTA_EVERY_N_POSTS = int(os.environ.get("CTA_EVERY_N_POSTS", "8"))
+
+NON_URGENT_DELAY_SECONDS = int(os.environ.get("NON_URGENT_DELAY_SECONDS", "180"))
 
 SOURCES = _json_list_env("SOURCES") or [
     "IraninArabic",
@@ -229,6 +231,42 @@ UPDATE_LEADS = [
     "🗞️ أفادت المصادر:",
 ]
 
+
+IRAN_SOURCES = {
+    "IraninArabic",
+    "iraninarabic_ir",
+    "arabic_farsnews",
+    "Tasnim_Ar",
+    "Khamenei_arabi",
+}
+
+BOMBARDMENT_WORDS = [
+    "قصف", "قصفت", "قصفوا", "غارات", "غارة", "صاروخ", "صواريخ",
+    "قصف صاروخي", "ضربة", "ضربات", "استهداف", "هجوم", "هجمات", "قنابل"
+]
+
+SAFE_IRAN_HYPE_LINES = [
+    "⚡ تصعيد ميداني",
+    "⚡ متابعة ميدانية عاجلة",
+    "⚡ تطور ميداني مهم",
+    "⚡ مستجدات الميدان",
+]
+
+def is_iran_source(src: str) -> bool:
+    return (src or "").strip() in IRAN_SOURCES
+
+def has_bombardment_words(text: str) -> bool:
+    t = text or ""
+    return any(w in t for w in BOMBARDMENT_WORDS)
+
+def build_context_line(post: Dict) -> str:
+    src = post.get("src", "")
+    text = post.get("text", "") or ""
+    if is_iran_source(src) and has_bombardment_words(text):
+        key = f"iran-bomb|{src}|{post.get('id','')}"
+        return stable_pick(SAFE_IRAN_HYPE_LINES, key)
+    return ""
+
 def is_urgent(text: str) -> bool:
     t = text or ""
     return any(w in t for w in URGENT_WORDS)
@@ -270,16 +308,19 @@ def add_lead_line(text: str, key: str) -> str:
 def append_signature_and_cta(text: str, attach_cta: bool) -> str:
     base = (text or "").strip()
 
-    # توقيع ثابت
-    sig = f"\n\n—\n{BRAND_NAME}\n{OUR_USERNAME}".strip()
+    # إزالة اسم العلامة من أي منشور
+    if BRAND_NAME:
+        base = base.replace(BRAND_NAME, "").strip()
+        base = re.sub(r"\n{3,}", "\n\n", base)
 
-    # CTA خفيف (اختياري)
-    if attach_cta:
-        sig = f"\n\n—\n📌 لمتابعة التنبيهات فعّل الإشعارات 🔔\n{BRAND_NAME}\n{OUR_USERNAME}".strip()
-
-    low = base.lower()
-    if _OUR_USER_PLAIN in low:
+    if _OUR_USER_PLAIN in base.lower():
         return base
+
+    if attach_cta:
+        sig = f"\n\n—\n📌 لمتابعة التنبيهات فعّل الإشعارات 🔔\n{OUR_USERNAME}".strip()
+    else:
+        sig = f"\n\n—\n{OUR_USERNAME}".strip()
+
     return (base + sig) if base else sig
 
 # =========================
@@ -642,7 +683,7 @@ async def main():
     log.info(f"📡 Sources: {len(SOURCES)} channels")
     log.info(f"⚡ Check every: {CHECK_EVERY_SECONDS}s | Fresh window: {MAX_AGE_SECONDS}s")
     log.info(f"🏷️ Our username: {OUR_USERNAME}")
-    log.info(f"📌 Daily limit: {DAILY_POST_LIMIT} | Digest every: {DIGEST_EVERY_SECONDS}s")
+    log.info(f"⏳ Non-urgent delay: {NON_URGENT_DELAY_SECONDS}s | Daily limit: {DAILY_POST_LIMIT}")
 
     backoff = 0.4
     last_prune = time.time()
@@ -650,33 +691,50 @@ async def main():
     last_mid: Dict[str, int] = {src: -1 for src in SOURCES}
     sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
-    # digest queue
-    digest_bucket: List[Dict] = []
-    last_digest_sent = time.time()
+    delayed_queue: List[Dict] = []
 
-    # daily limit
     today = day_key_utc()
     posted_today = 0
-
-    # CTA counter
     posts_since_cta = 0
 
     while True:
         sent_this_cycle = 0
         try:
-            # reset day
             new_day = day_key_utc()
             if new_day != today:
                 today = new_day
                 posted_today = 0
                 posts_since_cta = 0
-                digest_bucket.clear()
                 log.info("🗓️ New day: counters reset.")
 
-            # لو وصل السقف اليومي: نوقف نشر وننتظر
-            if posted_today >= DAILY_POST_LIMIT:
-                await asyncio.sleep(60)
-                continue
+            # أولاً: أرسل الأخبار غير العاجلة التي انتهت مهلة انتظارها
+            now_ts = time.time()
+            ready_items = [x for x in delayed_queue if x.get("send_at", 0) <= now_ts]
+            still_waiting = [x for x in delayed_queue if x.get("send_at", 0) > now_ts]
+            delayed_queue = still_waiting
+
+            ready_items.sort(key=lambda x: (x.get("send_at", 0), x.get("mid", -1)))
+            for item in ready_items:
+                if sent_this_cycle >= MAX_POSTS_PER_CYCLE:
+                    delayed_queue.append(item)
+                    continue
+
+                post = item["post"]
+                fp = item["fp"]
+
+                attach_cta = (CTA_EVERY_N_POSTS > 0 and posts_since_cta >= CTA_EVERY_N_POSTS)
+                html_text = format_normal_html(post, attach_cta=attach_cta)
+
+                ok = await send_post(bot, TARGET_CHANNEL, post, html_text=html_text)
+                if ok:
+                    mark_seen(con, post["id"], fp, status="sent_delayed")
+                    sent_this_cycle += 1
+                    if DAILY_POST_LIMIT > 0:
+                        posted_today += 1
+                    posts_since_cta = 0 if attach_cta else (posts_since_cta + 1)
+                else:
+                    item["send_at"] = time.time() + 30
+                    delayed_queue.append(item)
 
             tasks = [fetch_channel_posts(src, FETCH_LIMIT_PER_SOURCE, sem) for src in SOURCES]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -686,6 +744,7 @@ async def main():
             for idx, r in enumerate(results):
                 src = SOURCES[idx]
                 if isinstance(r, Exception):
+                    log.warning(f"Fetch failed for {src}: {r}")
                     continue
 
                 lm = last_mid.get(src, -1)
@@ -700,55 +759,39 @@ async def main():
 
             new_posts.sort(key=lambda x: (x.get("dt_utc") or now_utc(), x.get("mid", -1)))
 
+            queued_ids = {item["post"]["id"] for item in delayed_queue}
+
             for p in new_posts:
-                if posted_today >= DAILY_POST_LIMIT:
-                    break
                 if sent_this_cycle >= MAX_POSTS_PER_CYCLE:
                     break
                 if not is_fresh(p.get("dt_utc"), MAX_AGE_SECONDS):
                     continue
 
                 fp = content_fingerprint(p.get("text", ""), p.get("media_type"), p.get("media_url"))
-                if already_seen(con, p["id"], fp):
+                if already_seen(con, p["id"], fp) or p["id"] in queued_ids:
                     continue
 
-                # ✅ عاجل: ينشر فوراً
+                # عاجل: ينشر فوراً
                 if is_urgent(p.get("text", "")):
-                    attach_cta = (posts_since_cta >= CTA_EVERY_N_POSTS)
+                    attach_cta = (CTA_EVERY_N_POSTS > 0 and posts_since_cta >= CTA_EVERY_N_POSTS)
                     html_text = format_urgent_html(p, attach_cta=attach_cta)
 
                     ok = await send_post(bot, TARGET_CHANNEL, p, html_text=html_text)
                     if ok:
                         mark_seen(con, p["id"], fp, status="sent")
                         sent_this_cycle += 1
-                        posted_today += 1
+                        if DAILY_POST_LIMIT > 0:
+                            posted_today += 1
                         posts_since_cta = 0 if attach_cta else (posts_since_cta + 1)
                     else:
-                        # لو ما انرسل لأي سبب: ما نعلمه seen حتى لا يضيع
-                        pass
+                        log.warning(f"Failed to send urgent post: {p['id']}")
                 else:
-                    # ✅ غير عاجل: نضيفه للملخص (بدون نشر فوري)
-                    digest_bucket.append(p)
-                    mark_seen(con, p["id"], fp, status="queued")
-
-            # ✅ إرسال الملخص كل فترة
-            if time.time() - last_digest_sent >= DIGEST_EVERY_SECONDS:
-                if digest_bucket and posted_today < DAILY_POST_LIMIT:
-                    # ناخذ الأحدث
-                    digest_bucket.sort(key=lambda x: (x.get("dt_utc") or now_utc(), x.get("mid", -1)))
-                    batch = digest_bucket[-DIGEST_MAX_ITEMS:]
-
-                    attach_cta = (posts_since_cta >= CTA_EVERY_N_POSTS)
-                    digest_html = format_digest_html(batch, attach_cta=attach_cta)
-
-                    if digest_html:
-                        await send_text_html(bot, TARGET_CHANNEL, digest_html)
-                        posted_today += 1
-                        posts_since_cta = 0 if attach_cta else (posts_since_cta + 1)
-
-                    digest_bucket.clear()
-
-                last_digest_sent = time.time()
+                    delayed_queue.append({
+                        "post": p,
+                        "fp": fp,
+                        "send_at": time.time() + NON_URGENT_DELAY_SECONDS,
+                    })
+                    mark_seen(con, p["id"], fp, status="queued_delayed")
 
             backoff = 0.4
 
