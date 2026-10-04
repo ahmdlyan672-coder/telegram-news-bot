@@ -93,3 +93,110 @@ function sendMsg() {
     addLog("مو متصل بالسيرفر.");
     return;
   }
+
+  ws.send(JSON.stringify({type:"message", message:text}));
+  addLog("أنت: " + text);
+  el.value = "";
+}
+</script>
+</body>
+</html>
+"""
+
+async def index(request):
+    return web.Response(text=HTML, content_type="text/html")
+
+async def health(request):
+    return web.json_response({"ok": True, "rooms": len(rooms)})
+
+async def ws_handler(request):
+    room = (request.query.get("room") or "").strip().upper()
+
+    if not room or len(room) > 64:
+        return web.Response(status=400, text="Invalid room")
+
+    ws = web.WebSocketResponse(heartbeat=25)
+    await ws.prepare(request)
+
+    members = rooms.setdefault(room, [])
+
+    # الغرفة تدعم شخصين فقط
+    if len(members) >= 2:
+        await ws.send_json({
+            "type": "error",
+            "message": "الغرفة بيها شخصين بالفعل."
+        })
+        await ws.close()
+        return ws
+
+    members.append(ws)
+
+    if len(members) == 1:
+        await ws.send_json({
+            "type": "status",
+            "message": f"بانتظار الشخص الثاني. كود الغرفة: {room}"
+        })
+    elif len(members) == 2:
+        for peer in list(members):
+            if not peer.closed:
+                await peer.send_json({
+                    "type": "status",
+                    "message": "تم ربط الطرفين."
+                })
+
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get("type") != "message":
+                    continue
+
+                text = str(data.get("message", ""))[:5000]
+                if not text:
+                    continue
+
+                # نرسل للطرف الآخر فقط
+                for peer in list(rooms.get(room, [])):
+                    if peer is not ws and not peer.closed:
+                        await peer.send_json({
+                            "type": "message",
+                            "message": text
+                        })
+
+            elif msg.type == WSMsgType.ERROR:
+                print("WebSocket error:", ws.exception())
+                break
+
+    finally:
+        members = rooms.get(room, [])
+        if ws in members:
+            members.remove(ws)
+
+        # نخبر الطرف الثاني أن شريكه خرج
+        for peer in list(members):
+            if not peer.closed:
+                try:
+                    await peer.send_json({
+                        "type": "status",
+                        "message": "الطرف الآخر خرج من الغرفة."
+                    })
+                except Exception:
+                    pass
+
+        if not members:
+            rooms.pop(room, None)
+
+    return ws
+
+app = web.Application()
+app.router.add_get("/", index)
+app.router.add_get("/health", health)
+app.router.add_get("/ws", ws_handler)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    web.run_app(app, host="0.0.0.0", port=port)
